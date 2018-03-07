@@ -1,12 +1,12 @@
 # Bbox3d
-- 3d Bounding box visualization of the 2d detected objects in RVIZ.
+3d Bounding box visualization of the 2d detected objects in RVIZ.
 
 # Installation:
 - Install the ROS dependencies
 ```sh
 $ sudo apt-get install ros-kinetic-cv-bridge ros-kinetic-image-transport ros-kinetic-pcl-ros
 ``` 
-- get the [darknet_ros](https://github.com/leggedrobotics/darknet_ros) package. 
+- Get the [darknet_ros](https://github.com/leggedrobotics/darknet_ros) package. 
 - Put both the packages inside ros workspace and use catkin_make to build them.
   ```sh
   $ cd BBox3d
