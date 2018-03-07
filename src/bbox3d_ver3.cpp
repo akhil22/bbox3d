@@ -3,17 +3,20 @@
 #include <Eigen/Geometry>
 #include <cv_bridge/cv_bridge.h>
 #include <darknet_ros_msgs/BoundingBoxes.h>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <list>
 #include <math.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/time_synchronizer.h>
 #include <opencv2/core/core.hpp>
+#include <opencv2/core/eigen.hpp>
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
-#include <opencv2/video/tracking.hpp>
+//#include <opencv2/tracking.hpp>
 #include <pcl/common/common.h>
 #include <pcl/common/pca.h>
 #include <pcl/filters/extract_indices.h>
@@ -27,18 +30,27 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
+#include <signal.h>
 #include <string>
 #include <tf/tf.h>
 #include <tf/transform_datatypes.h>
 #include <visualization_msgs/MarkerArray.h>
 #define LEAF_SIZE 0.5
+#define MAX_NUM_BBOX 20
 typedef message_filters::sync_policies::ApproximateTime<
     sensor_msgs::PointCloud2, sensor_msgs::Image,
     darknet_ros_msgs::BoundingBoxes>
     MySyncPolicy;
+struct BBox {
+  cv::MatND hist_bbox;
+  cv::Mat bbox_image;
+  ros::Time detection_time;
+  int detection_index;
+};
 class DrawBbox {
 public:
   DrawBbox() {
+    frame_num = 0;
     nh_ = new ros::NodeHandle("~");
     // initialize all the parameters
 
@@ -52,9 +64,12 @@ public:
 
     nh_->param("in_cloud_topic", in_cloud_topic,
                std::string("/velodyne_points"));
+    nh_->param("enable_tracking", enable_tracking, true);
     nh_->param("out_cloud_topic", out_cloud_topic, std::string("/bbox_cloud"));
     nh_->param("in_image_topic", in_image_topic,
                std::string("/camera0/image_raw"));
+    nh_->param("label_file_path", label_file_path,
+               std::string("/home/akhil/labels.txt"));
     nh_->param("depth_image_topic", depth_image_topic,
                std::string("/velodyne_depth_image"));
     nh_->param("lidar_frame_id", lidar_frame_id, std::string("/velodyne"));
@@ -74,6 +89,7 @@ public:
     K = cv::Mat(3, 3, CV_64FC1, k.data());
     C = cv::Mat(2, 1, CV_64FC1, c.data());
     D = cv::Mat(5, 1, CV_64FC1, d.data());
+    label_file.open(label_file_path);
 
     std::cout << "using rotation matrix R = " << std::endl
               << " " << R << std::endl
@@ -107,6 +123,9 @@ public:
     // bind the callbacks
     sync->registerCallback(boost::bind(&DrawBbox::SyncCB, this, _1, _2, _3));
     current_bboxes.boundingBoxes.resize(0);
+    track_id.resize(0);
+    current_track_id = 0;
+    max_track_list_size = 30;
   }
   std::vector<int> GetImageProjection(cv::Mat &point3d, bool &is_valid) {
     std::vector<int> proj_point;
@@ -338,6 +357,10 @@ public:
       bbox_cluster_num_points[i] = 0;
       cluster_dist[i] = std::numeric_limits<float>::max();
     }
+    std::vector<float> kitti_alpha(MAX_NUM_BBOX);
+    std::vector<cv::Mat> kitti_location(MAX_NUM_BBOX);
+    std::vector<float> kitti_rotation_y(MAX_NUM_BBOX);
+    std::vector<Eigen::Vector3f> kitti_size(MAX_NUM_BBOX);
     for (std::vector<pcl::PointIndices>::const_iterator
              it = cluster_indices.begin();
          it != cluster_indices.end(); it++, t++) {
@@ -421,7 +444,7 @@ public:
       //         << eigen_vector_pca << std::endl;
       Eigen::Vector4f cluster_centroid;
       pcl::compute3DCentroid(*filtered_cloud, cluster_centroid);
-      //*temp_out_cloud += *filtered_cloud;
+      *temp_out_cloud += *filtered_cloud;
       //  std::cout << "cluster_centroid" << std::endl
       //          << cluster_centroid << std::endl;
       tf::Quaternion quat;
@@ -429,6 +452,19 @@ public:
       tf::matrixEigenToTF(eigen_vector_pca_double, tf_rotation);
       double roll, pitch, yaw;
       tf_rotation.getRPY(roll, pitch, yaw);
+      // ROS_INFO("filling data for %d box", j);
+      kitti_rotation_y[j] = yaw;
+      kitti_alpha[j] = atan2(cluster_centroid(1), cluster_centroid(0));
+      Eigen::Vector3f bbox_size;
+      bbox_size(0) = max_point.z - min_point.z;
+      bbox_size(1) = max_point.y - min_point.y;
+      bbox_size(2) = max_point.x - min_point.x;
+      kitti_size[j] = (bbox_size);
+      cv::Mat cluster_center(3, 1, CV_64FC1);
+      cluster_center.at<double>(0, 0) = cluster_centroid(0);
+      cluster_center.at<double>(1, 0) = cluster_centroid(1);
+      cluster_center.at<double>(2, 0) = cluster_centroid(2);
+      kitti_location[j] = (R * cluster_center + T);
       // tf_rotation.getRotation(quat);
       quat.setRPY(0, 0, yaw);
       quat.normalize();
@@ -463,14 +499,177 @@ public:
       marker.color.g = 1.0;
       marker.color.b = 0;
       bbox_markers.markers.push_back(marker);
+
       //  ROS_INFO("info pushing marker");
     }
-    for (int j = 0; j < current_bboxes.boundingBoxes.size(); j++) {
+    int *track_result = new int[bbox2d->boundingBoxes.size()];
+    if (enable_tracking) {
+      int h_bins = 50;
+      int s_bins = 60;
+      int histSize[] = {h_bins, s_bins};
+      float h_ranges[] = {0, 180};
+      float s_ranges[] = {0, 256};
+      const float *ranges[] = {h_ranges, s_ranges};
+
+      int channels[] = {0, 1};
+      int success_matches = 0;
+      int bottle_flag = 0;
+      int list_size = track_list.size();
+      for (size_t j = 0; j < bbox2d->boundingBoxes.size(); j++) {
+        if (bbox_cluster_map[j] == -1) {
+          continue;
+        }
+        int xmin, ymin, xmax, ymax;
+        xmin = bbox2d->boundingBoxes[j].xmin;
+        ymin = bbox2d->boundingBoxes[j].ymin;
+        xmax = bbox2d->boundingBoxes[j].xmax;
+        ymax = bbox2d->boundingBoxes[j].ymax;
+        // ROS_INFO("bbox %d %d %d %d", xmin, ymin, xmax, ymax);
+        cv::Rect2d track_bbox(xmin, ymin, xmax - xmin, ymax - ymin);
+        // cv::rectangle(cv_ptr->image, track_bbox, cv::Scalar(255, 0, 0), 2,
+        // 1);
+        // imshow("tracker", cv_ptr->image);
+        // cv::waitKey(0);
+        cv::Rect2d track_bbox2;
+        cv::Mat bbox_image(cv_ptr->image, track_bbox);
+        cv::resize(bbox_image, bbox_image, cv::Size2i(50, 50));
+        cv::Mat hsv_bbox_image;
+        cv::cvtColor(bbox_image, hsv_bbox_image, cv::COLOR_BGR2HSV);
+        cv::MatND hist_bbox;
+        cv::calcHist(&hsv_bbox_image, 1, channels, cv::Mat(), hist_bbox, 2,
+                     histSize, ranges, true, false);
+        cv::normalize(hist_bbox, hist_bbox, 0, 1, cv::NORM_MINMAX, -1,
+                      cv::Mat());
+        // ROS_INFO("before tracking = %f, %f, %f, %f", track_bbox.x,
+        // track_bbox.y,
+        // track_bbox.width, track_bbox.height);
+        // ROS_INFO("after tracking = %f, %f, %f, %f", track_bbox.x,
+        // track_bbox.y,
+        // track_bbox.width, track_bbox.height);
+        //    cv::imshow("matching this", bbox_image);
+        //   cv::waitKey(0);
+        cv::Mat best_match;
+        double score = -1;
+        std::list<BBox>::iterator match_it;
+        int i = 0;
+        for (std::list<BBox>::iterator it = track_list.begin(); i < list_size;
+             ++it, i++) {
+          double base = cv::compareHist(hist_bbox, it->hist_bbox, 0);
+          if (score < base) {
+            score = base;
+            match_it = it;
+            //      cv::imshow("last best match",
+            //      match_it->bbox_image);
+            //     cv::waitKey(10);
+          }
+        }
+        if (score > 0.8) {
+          match_it->hist_bbox = hist_bbox;
+          track_result[j] = match_it->detection_index;
+          //  cv::imshow("matched with this", match_it->bbox_image);
+          // cv::waitKey(0);
+
+        } else {
+          // ROS_INFO("adding with score = %f", score);
+          // cv::imshow("adding this", bbox_image);
+          BBox current_bbox;
+          current_bbox.hist_bbox = hist_bbox;
+          current_bbox.bbox_image = bbox_image;
+          current_bbox.detection_time = ros::Time::now();
+          current_bbox.detection_index = current_track_id;
+          track_result[j] = current_track_id;
+          current_track_id++;
+          track_list.push_back(current_bbox);
+          if (track_list.size() > max_track_list_size) {
+            track_list.pop_front();
+          }
+        }
+
+        /*for (int i = 0; i < num_bbox; i++) {
+          if (bbox2d->boundingBoxes[i].Class == "bottle") {
+            bottle_flag = 1;
+            continue;
+          }
+          xmin = bbox2d->boundingBoxes[i].xmin;
+          ymin = bbox2d->boundingBoxes[i].ymin;
+          xmax = bbox2d->boundingBoxes[i].xmax;
+          ymax = bbox2d->boundingBoxes[i].ymax;
+          cv::Rect2d prev_bbox(xmin, ymin, xmax - xmin, ymax - ymin);
+          cv::Mat prev_bbox_image(cv_ptr->image, prev_bbox);
+          cv::Mat prev_hsv_bbox_image;
+          cv::cvtColor(prev_bbox_image, prev_hsv_bbox_image,
+        cv::COLOR_BGR2HSV);
+          cv::MatND prev_hist_bbox;
+          cv::calcHist(&prev_hsv_bbox_image, 1, channels, cv::Mat(),
+                       prev_hist_bbox, 2, histSize, ranges, true,
+        false);
+          cv::normalize(prev_hist_bbox, prev_hist_bbox, 0, 1,
+        cv::NORM_MINMAX,
+        -1,
+                        cv::Mat());
+          double base = cv::compareHist(hist_bbox, prev_hist_bbox, 0);
+          if (score < base) {
+            match_id = i;
+            score = base;
+            //   best_match = prev_bbox_image;
+          }
+          ROS_INFO("compare result for j=%d, i=%d %f", j, i, base);
+          //   ROS_INFO("overlap for i, j = %d, %d, %f", j, i,
+          //           (track_bbox & prev_bbox).area() /
+          //              (track_bbox | prev_bbox).area());
+        }*/
+        // cv::imshow("matched with", best_match);
+        // ROS_INFO("match score %f", score);
+        // if (score > 0.9) {
+        //  success_matches++;
+        //  }
+
+        // cv::waitKey(0);
+        // cv::rectangle(cv_ptr->image, track_bbox2, cv::Scalar(255, 0,
+        // 0), 2,
+        // 1);
+        // cv::rectangle(cv_ptr->image, track_bbox, cv::Scalar(0, 0,
+        // 255), 2,
+        // 1);
+      }
     }
-    current_bboxes.boundingBoxes.resize(0);
-    for (int j = 0; j < num_bbox; j++) {
-      current_bboxes.boundingBoxes.push_back(bbox2d->boundingBoxes[j]);
+    // if (num_bbox - bottle_flag - success_matches > 0) {
+    //  max_track_id = max_track_id + num_bbox - success_matches -
+    //  bottle_flag;
+    // }
+    // ROS_INFO("done Tracking");
+    /* current_bboxes.boundingBoxes.resize(0);
+     for (int j = 0; j < num_bbox; j++) {
+       if (bbox2d->boundingBoxes[j].Class == "bottle") {
+         continue;
+       }
+       current_bboxes.boundingBoxes.push_back(bbox2d->boundingBoxes[j]);
+     }*/
+    for (size_t j = 0; j < num_bbox; j++) {
+      if (bbox_cluster_map[j] == -1) {
+        continue;
+      }
+      int xmin, ymin, xmax, ymax;
+      xmin = bbox2d->boundingBoxes[j].xmin;
+      xmax = bbox2d->boundingBoxes[j].xmax;
+      ymin = bbox2d->boundingBoxes[j].ymin;
+      ymax = bbox2d->boundingBoxes[j].ymax;
+      if (enable_tracking) {
+        label_file << frame_num << " " << track_result[j] << " ";
+      }
+      label_file << bbox2d->boundingBoxes[j].Class << " 0"
+                 << " 3 " << kitti_alpha[j] << " " << xmin << " " << ymin << " "
+                 << xmax << " "
+                 << " " << ymax << " " << kitti_size[j](0) << " "
+                 << kitti_size[j](1) << " " << kitti_size[j](2) << " "
+                 << kitti_location[j].at<double>(0, 0) << " "
+                 << kitti_location[j].at<double>(1, 0) << " "
+                 << kitti_location[j].at<double>(2, 0) << " "
+                 << kitti_rotation_y[j] << " "
+                 << "\n";
     }
+    // ROS_INFO("max track id = %d", current_track_id);
+    // ROS_INFO("num objects in track list track = %d", track_list.size());
     //  ROS_INFO("pushed the marker");
     //   break;
 
@@ -478,16 +677,17 @@ public:
     //    for (int j = 0; j < bbox2d->boundingBoxes.size(); j++) {
     //   }
 
-    //    pcl::PCLPointCloud2 *temp_cloud = new pcl::PCLPointCloud2;
-    //   pcl::toPCLPointCloud2(*temp_out_cloud, *temp_cloud);
+    pcl::PCLPointCloud2 *temp_cloud = new pcl::PCLPointCloud2;
+    pcl::toPCLPointCloud2(*temp_out_cloud, *temp_cloud);
     //   pcl::toPCLPointCloud2(*image_cloud, *temp_cloud);
-    pcl_conversions::fromPCL(cloud, out_cloud);
+    pcl_conversions::fromPCL(*temp_cloud, out_cloud);
     out_cloud.header.stamp = ros::Time::now();
     out_cloud.header.frame_id = lidar_frame_id;
 
     // publish point cluster cloud with color and bbox
     bbox3d_pub.publish(bbox_markers);
     cloud_pub.publish(out_cloud);
+    frame_num++;
   }
   void SyncCB(const sensor_msgs::PointCloud2ConstPtr &cloud,
               const sensor_msgs::ImageConstPtr &img,
@@ -521,6 +721,11 @@ public:
     // pass cloud, image and bbox2d to get 3d bbox
     PubColorCloud(*in_cloud, cv_ptr, bbox2d);
   }
+  static void SigintHandler(int sig) {
+    ROS_INFO("closing file and shutting down");
+    label_file.close();
+    ros::shutdown();
+  }
 
 private:
   ros::NodeHandle *nh_;
@@ -541,11 +746,23 @@ private:
   std::vector<double> r, t, k, c, d;
   // camera lidar calibration data , cv mat
   cv::Mat R, T, K, C, D;
+  Eigen::Matrix3f cam_to_world_rotation;
+  Eigen::Vector3f cam_to_world_translation;
   visualization_msgs::MarkerArray bbox_markers;
   darknet_ros_msgs::BoundingBoxes current_bboxes;
+  static std::ofstream label_file;
+  std::vector<int> track_id;
+  std::string label_file_path;
+  int current_track_id;
+  int max_track_list_size;
+  std::list<BBox> track_list;
+  long long int frame_num;
+  bool enable_tracking;
 };
+std::ofstream DrawBbox::label_file;
 int main(int argc, char **argv) {
-  ros::init(argc, argv, "bbox");
+  ros::init(argc, argv, "bbox", ros::init_options::NoSigintHandler);
   DrawBbox draw_bbox;
+  signal(SIGINT, DrawBbox::SigintHandler);
   ros::spin();
 }

@@ -131,6 +131,7 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
   ${catkin_INCLUDE_DIRS}
   ${Boost_INCLUDE_DIRS}
+
 )
 
 ## Declare a C++ library
@@ -166,6 +167,8 @@ add_executable(bbox3d src/bbox3d.cpp )
 target_link_libraries(bbox3d ${catkin_LIBRARIES} ${OpenCV_LIBS} ${Boost_LIBS})
 add_executable(bbox3d_ver_2 src/bbox3d_ver2.cpp )
 target_link_libraries(bbox3d_ver_2 ${catkin_LIBRARIES} ${OpenCV_LIBS} ${Boost_LIBS})
+add_executable(bbox3d_ver_3 src/bbox3d_ver3.cpp )
+target_link_libraries(bbox3d_ver_3 ${catkin_LIBRARIES} ${OpenCV_LIBS} ${Boost_LIBS})
 #############
 ## Install ##
 #############
